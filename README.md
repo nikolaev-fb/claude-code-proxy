@@ -131,14 +131,14 @@ LANGFUSE_HOST=http://localhost:3000
 
 ## Features
 
-- ✅ Streaming responses (real-time)
-- ✅ Non-streaming responses
-- ✅ Automatic model mapping
-- ✅ Tool/function calling support
-- ✅ System prompt conversion
-- ✅ Token usage tracking
-- ✅ Error handling & logging
-- ✅ Optional LangFuse integration
+✅ Streaming responses (real-time)
+✅ Non-streaming responses
+✅ Automatic model mapping
+✅ Tool/function calling support
+✅ System prompt conversion
+✅ Token usage tracking
+✅ Error handling & logging
+✅ Optional LangFuse integration
 
 ---
 
@@ -154,7 +154,7 @@ LANGFUSE_HOST=http://localhost:3000
 
 ## Support & Contributing
 
-- **Issues**: Report bugs or request features via GitHub Issues
+- **Issues**: Feel free to create new PR
 - **OpenRouter Docs**: https://openrouter.ai/docs
 - **Claude Code Docs**: https://docs.claude.com/claude-code
 
