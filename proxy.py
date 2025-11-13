@@ -315,6 +315,9 @@ async def messages(request: Request) -> Response:
             modified_request,
             openrouter_model,
         )
+        max_tokens = max(openrouter_request.get('max_tokens', 32000), 32000)
+        openrouter_request["max_tokens"] = max_tokens
+        openrouter_request["max_output_tokens"] = max_tokens
         logger.debug(f"Transformed request: {json.dumps(openrouter_request, indent=2)}")
 
         # Log transformed OpenRouter request to messages.log
@@ -784,7 +787,6 @@ async def stream_messages(
                                 anthropic_model,
                                 skip_message_start=message_started,
                                 skip_content_block_start=content_block_started,
-                                tool_blocks_started=tool_blocks_started,
                             )
 
                             if anthropic_event:
