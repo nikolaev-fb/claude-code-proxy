@@ -103,7 +103,7 @@ OPENROUTER_API_KEY=sk-or-v1-...
 
 ### File Logging (Optional)
 
-**⚠ Warning: Log files can grow very large very quickly!**
+**⚠ Warning: Log files can grow very quickly!**
 
 ```bash
 # Enable logging to logs/messages.log
@@ -131,14 +131,14 @@ LANGFUSE_HOST=http://localhost:3000
 
 ## Features
 
--  Streaming responses (real-time)
--  Non-streaming responses
--  Automatic model mapping
--  Tool/function calling support
--  System prompt conversion
--  Token usage tracking
--  Error handling & logging
--  Optional LangFuse integration
+- ✅ Streaming responses (real-time)
+- ✅ Non-streaming responses
+- ✅ Automatic model mapping
+- ✅ Tool/function calling support
+- ✅ System prompt conversion
+- ✅ Token usage tracking
+- ✅ Error handling & logging
+- ✅ Optional LangFuse integration
 
 ---
 
