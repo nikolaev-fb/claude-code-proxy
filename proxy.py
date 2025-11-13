@@ -14,6 +14,7 @@ from typing import AsyncGenerator, Dict, Any, Optional
 import asyncio
 import os
 from datetime import datetime
+from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException, Response
@@ -34,74 +35,215 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Setup file logging for /messages endpoint
-messages_log_dir = "logs"
-if not os.path.exists(messages_log_dir):
-    os.makedirs(messages_log_dir)
 
-messages_log_file = os.path.join(messages_log_dir, "messages.log")
-messages_logger = logging.getLogger("messages")
-messages_logger.setLevel(logging.DEBUG)
-messages_logger.propagate = False  # Prevent propagation to parent loggers
+def _setup_messages_logger() -> Optional[logging.Logger]:
+    """
+    Configure dedicated logger for /messages endpoint (if enabled).
 
-# Clear any existing handlers to avoid duplicates
-messages_logger.handlers.clear()
+    Returns:
+        Configured logger instance that writes to logs/messages.log, or None if disabled
+    """
+    if not settings.FILE_LOGGING_ENABLED:
+        logger.info("File logging disabled (FILE_LOGGING_ENABLED=false)")
+        return None
 
-# File handler for messages
-file_handler = logging.FileHandler(messages_log_file)
-file_handler.setLevel(logging.DEBUG)
-file_handler.setFormatter(logging.Formatter(
-    '%(asctime)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-))
-messages_logger.addHandler(file_handler)
+    messages_log_dir = "logs"
+    if not os.path.exists(messages_log_dir):
+        os.makedirs(messages_log_dir)
 
-# Also log to console
-console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.DEBUG)
-console_handler.setFormatter(logging.Formatter('[MESSAGES] %(message)s'))
-# messages_logger.addHandler(console_handler)
+    messages_log_file = os.path.join(messages_log_dir, "messages.log")
+    msg_logger = logging.getLogger("messages")
+    msg_logger.setLevel(logging.DEBUG)
+    msg_logger.propagate = False
+    msg_logger.handlers.clear()  # Avoid duplicates
 
-logger.info(f"Messages endpoint logging to: {os.path.abspath(messages_log_file)}")
+    # File handler
+    file_handler = logging.FileHandler(messages_log_file)
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(logging.Formatter(
+        '%(asctime)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    ))
+    msg_logger.addHandler(file_handler)
 
-# Initialize FastAPI app
-app = FastAPI(
-    title="Anthropic-to-OpenRouter Proxy",
-    description="Proxy that converts Anthropic API requests to OpenRouter format",
-    version="1.0.0",
-)
+    logger.info(f"Messages endpoint file logging enabled: {os.path.abspath(messages_log_file)}")
+    return msg_logger
+
+
+# Setup messages logger (optional)
+messages_logger = _setup_messages_logger()
+
+
+def _log_message(level: str, message: str) -> None:
+    """
+    Log message to messages.log if file logging is enabled.
+
+    Args:
+        level: Log level ('info', 'debug', 'error', 'warning')
+        message: Message to log
+    """
+    if not messages_logger:
+        return
+    log_func = getattr(messages_logger, level.lower(), messages_logger.info)
+    log_func(message)
+
+
+def _update_trace_safe(trace: Optional[Any], output: Optional[Dict] = None, metadata: Optional[Dict] = None) -> None:
+    """
+    Safely update LangFuse trace with error handling.
+
+    Args:
+        trace: LangFuse trace object (or None)
+        output: Output data to log
+        metadata: Metadata to attach to trace
+    """
+    if not trace:
+        return
+    try:
+        trace.update(output=output, metadata=metadata)
+    except Exception as e:
+        logger.warning(f"Failed to update LangFuse trace: {e}")
+
+
+def _log_stream_event(anthropic_event: str) -> None:
+    """
+    Log streaming event to messages.log with structured parsing (if enabled).
+
+    Args:
+        anthropic_event: SSE event string in Anthropic format (may contain multiple events)
+    """
+    if not messages_logger:
+        return  # File logging disabled
+
+    try:
+        # Split by double newlines to separate multiple SSE events
+        # Example: "event: xxx\ndata: {...}\n\nevent: yyy\ndata: {...}\n\n"
+        events = anthropic_event.strip().split('\n\n')
+
+        for event_block in events:
+            if not event_block.strip():
+                continue
+
+            # Parse each SSE event block
+            lines = event_block.strip().split('\n')
+            data_line = None
+
+            for line in lines:
+                if line.startswith('data: '):
+                    data_line = line[6:]  # Remove "data: " prefix
+                    break
+
+            if not data_line:
+                continue
+
+            event_data = json.loads(data_line)
+            event_type = event_data.get('type', 'unknown')
+
+            msg_id = ''
+            if event_type == 'message_start':
+                msg_id = event_data.get('message', {}).get('id')
+                usage = event_data.get('message', {}).get('usage', {})
+                messages_logger.info(f"[STREAM] message_start - ID: {msg_id}")
+                messages_logger.debug(f"  Initial usage: input_tokens={usage.get('input_tokens', 0)}, output_tokens={usage.get('output_tokens', 0)}")
+
+            elif event_type == 'content_block_start':
+                messages_logger.debug(f"[STREAM {msg_id}] content_block_start")
+
+            elif event_type == 'content_block_delta':
+                delta = event_data.get('delta', {})
+                delta_type = delta.get('type', '')
+
+                if delta_type == 'text_delta':
+                    text = delta.get('text', '')
+                    if text:
+                        messages_logger.info(f"[STREAM {msg_id}] content_block_delta (text) - Text: {text}")
+                    else:
+                        messages_logger.debug(f"[STREAM {msg_id}] content_block_delta (text) - empty")
+                elif delta_type == 'input_json_delta':
+                    partial_json = delta.get('partial_json', '')
+                    if partial_json:
+                        messages_logger.info(f"[STREAM {msg_id}] content_block_delta (input_json) - JSON: {partial_json}")
+                    else:
+                        messages_logger.debug(f"[STREAM {msg_id}] content_block_delta (input_json) - empty")
+                else:
+                    messages_logger.debug(f"[STREAM {msg_id}] content_block_delta (unknown type: {delta_type})")
+                    messages_logger.debug(event_data)
+
+            elif event_type == 'content_block_stop':
+                messages_logger.debug(f"[STREAM {msg_id}] content_block_stop")
+
+            elif event_type == 'message_delta':
+                stop_reason = event_data.get('delta', {}).get('stop_reason')
+                usage = event_data.get('usage', {})
+                messages_logger.info(f"[STREAM {msg_id}] message_delta - Stop Reason: {stop_reason}")
+                messages_logger.debug(f"  Final usage: input_tokens={usage.get('input_tokens', 0)}, output_tokens={usage.get('output_tokens', 0)}, cache_read={usage.get('cache_read_input_tokens', 0)}, cache_creation={usage.get('cache_creation_input_tokens', 0)}")
+
+            elif event_type == 'message_stop':
+                messages_logger.debug(f"[STREAM {msg_id}] message_stop")
+
+            else:
+                messages_logger.info(f"[STREAM {msg_id}] {event_type}")
+
+    except Exception as log_error:
+        logger.debug(f"Error logging stream event: {log_error}")
+        messages_logger.debug(f"[ERROR] logging stream event: {log_error}")
+        messages_logger.debug(f"[STREAM {msg_id}] Event (raw): {anthropic_event}")
+
 
 # LangFuse integration (optional)
 langfuse_client = None
-if settings.LANGFUSE_ENABLED:
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Lifespan context manager for FastAPI application.
+    Handles startup and shutdown events.
+    """
+    # Startup
+    global langfuse_client
+
+    # Initialize LangFuse if enabled
+    if settings.LANGFUSE_ENABLED:
+        try:
+            from langfuse import Langfuse
+            langfuse_client = Langfuse(
+                public_key=settings.LANGFUSE_API_KEY,
+                secret_key=settings.LANGFUSE_SECRET_KEY,
+                host=settings.LANGFUSE_HOST,
+            )
+            logger.info("LangFuse logging enabled")
+        except Exception as e:
+            logger.warning(f"Failed to initialize LangFuse: {e}")
+            langfuse_client = None
+
+    # Validate configuration
     try:
-        from langfuse import Langfuse
-        langfuse_client = Langfuse(
-            public_key=settings.LANGFUSE_API_KEY,
-            secret_key=settings.LANGFUSE_SECRET_KEY,
-            host=settings.LANGFUSE_HOST,
-        )
-        logger.info("LangFuse logging enabled")
-    except Exception as e:
-        logger.warning(f"Failed to initialize LangFuse: {e}")
-        langfuse_client = None
+        settings.validate()
+        logger.info("Configuration validated successfully")
+    except ValueError as e:
+        logger.error(f"Configuration error: {e}")
+        raise
 
-# Validate configuration on startup
-try:
-    settings.validate()
-    logger.info("Configuration validated successfully")
-except ValueError as e:
-    logger.error(f"Configuration error: {e}")
-    raise
-
-
-@app.on_event("startup")
-async def startup_event():
-    """Initialize on startup."""
+    # Log startup info
     logger.info(f"Starting proxy on {settings.PROXY_HOST}:{settings.PROXY_PORT}")
     logger.info(f"OpenRouter base URL: {settings.OPENROUTER_BASE_URL}")
     if settings.LANGFUSE_ENABLED:
         logger.info(f"LangFuse host: {settings.LANGFUSE_HOST}")
+
+    yield  # Application runs here
+
+    # Shutdown (cleanup if needed)
+    logger.info("Shutting down proxy server")
+
+
+# Initialize FastAPI app with lifespan handler
+app = FastAPI(
+    title="Anthropic-to-OpenRouter Proxy",
+    description="Proxy that converts Anthropic API requests to OpenRouter format",
+    version="1.0.0",
+    lifespan=lifespan,
+)
 
 
 @app.get("/health")
@@ -123,33 +265,65 @@ async def messages(request: Request) -> Response:
         logger.debug(f"Incoming request: {json.dumps(request_body, indent=2)}")
 
         # Log to messages file (simplified - no full request body)
-        messages_logger.info("=" * 80)
-        messages_logger.info("INCOMING REQUEST")
-        # messages_logger.info(f"{json.dumps(request_body, indent=2)}")
-        messages_logger.info(f"Timestamp: {datetime.now().isoformat()}")
+        _log_message("info", "=" * 80)
+        _log_message("info", "RAW INCOMING REQUEST")
+        _log_message("info", json.dumps(request_body, indent=2))
+        _log_message("info", f"Timestamp: {datetime.now().isoformat()}")
 
         # Extract model and convert to OpenRouter format
         anthropic_model = request_body.get("model", "")
         openrouter_model = settings.get_openrouter_model(anthropic_model)
         logger.info(f"Converting model {anthropic_model} -> {openrouter_model}")
-        messages_logger.info(f"Model Conversion: {anthropic_model} -> {openrouter_model}")
+        _log_message("info", f"Model Conversion: {anthropic_model} -> {openrouter_model}")
+
+        # IMPORTANT: Detect and handle priming assistant message
+        # Claude Code sometimes sends a last assistant message with priming text (like "{")
+        # to guide JSON responses. We need to:
+        # 1. Remove it from the request to OpenRouter (so model generates full response)
+        # 2. Strip the priming text from the start of our response (to avoid duplication in client)
+        modified_request = request_body.copy()
+        messages = modified_request.get("messages", [])
+        priming_text_to_strip = ""  # Will hold the priming text we need to strip from response
+
+        if messages and messages[-1].get("role") == "assistant":
+            last_msg_content = messages[-1].get("content", "")
+            # Check if it's a short priming text (< 10 chars) that looks like JSON start
+            is_priming = False
+            priming_text = ""
+
+            if isinstance(last_msg_content, str) and len(last_msg_content) < 10:
+                is_priming = True
+                priming_text = last_msg_content
+            elif isinstance(last_msg_content, list):
+                # Array format - check if total text is short
+                total_text = ""
+                for item in last_msg_content:
+                    if isinstance(item, dict) and item.get("type") == "text":
+                        total_text += item.get("text", "")
+                if len(total_text) < 10:
+                    is_priming = True
+                    priming_text = total_text
+
+            if is_priming:
+                logger.info(f"Detected priming assistant message: {repr(priming_text)}")
+                _log_message("info", f"Detected priming assistant message: {repr(priming_text)}")
+                modified_request["messages"] = messages[:-1]
+                priming_text_to_strip = priming_text
 
         # Transform request to OpenRouter format
         openrouter_request = RequestTransformer.transform_messages_request(
-            request_body,
+            modified_request,
             openrouter_model,
         )
         logger.debug(f"Transformed request: {json.dumps(openrouter_request, indent=2)}")
 
         # Log transformed OpenRouter request to messages.log
-        messages_logger.info("-" * 80)
-        messages_logger.info("TRANSFORMED OPENROUTER REQUEST")
-        messages_logger.info(f"{json.dumps(openrouter_request, indent=2)}")
+        _log_message("info", "-" * 80)
         if "tools" in openrouter_request:
-            messages_logger.info(f"Tools count: {len(openrouter_request['tools'])}")
+            _log_message("info", f"Tools count: {len(openrouter_request['tools'])}")
             for idx, tool in enumerate(openrouter_request['tools']):
-                messages_logger.info(f"  Tool {idx + 1}: {tool.get('function', {}).get('name', 'unknown')}")
-        messages_logger.info("-" * 80)
+                _log_message("info", f"  Tool {idx + 1}: {tool.get('function', {}).get('name', 'unknown')}")
+        _log_message("info", "-" * 80)
 
         # Create LangFuse trace AFTER transformation (captures the ACTUAL request sent to OpenRouter)
         if langfuse_client:
@@ -178,27 +352,29 @@ async def messages(request: Request) -> Response:
         # Check if streaming is requested
         is_streaming = request_body.get("stream", False)
 
-        messages_logger.info(f"Streaming: {is_streaming}")
+        _log_message("info", f"Streaming: {is_streaming}")
 
-        # Extract initial assistant content (priming text like "{" for JSON)
+        # DISABLED: Extract initial assistant content (priming text like "{" for JSON)
+        # This was causing duplicate symbols (e.g., "{{") when OpenRouter models
+        # already generate the priming text. Commenting out to prevent duplication.
         initial_assistant_content = ""
-        if is_streaming:
-            messages = request_body.get("messages", [])
-            if messages and messages[-1].get("role") == "assistant":
-                # Last message is from assistant - extract its content for prepending
-                last_msg = messages[-1].get("content", [])
-                if isinstance(last_msg, list):
-                    # Array format
-                    for item in last_msg:
-                        if isinstance(item, dict) and item.get("type") == "text":
-                            initial_assistant_content += item.get("text", "")
-                elif isinstance(last_msg, str):
-                    # String format
-                    initial_assistant_content = last_msg
+        # if is_streaming:
+        #     messages = request_body.get("messages", [])
+        #     if messages and messages[-1].get("role") == "assistant":
+        #         # Last message is from assistant - extract its content for prepending
+        #         last_msg = messages[-1].get("content", [])
+        #         if isinstance(last_msg, list):
+        #             # Array format
+        #             for item in last_msg:
+        #                 if isinstance(item, dict) and item.get("type") == "text":
+        #                     initial_assistant_content += item.get("text", "")
+        #         elif isinstance(last_msg, str):
+        #             # String format
+        #             initial_assistant_content = last_msg
 
         if is_streaming:
             return StreamingResponse(
-                stream_messages(openrouter_request, anthropic_model, trace, initial_assistant_content),
+                stream_messages(openrouter_request, anthropic_model, trace, initial_assistant_content, priming_text_to_strip),
                 media_type="text/event-stream",
             )
         else:
@@ -211,29 +387,13 @@ async def messages(request: Request) -> Response:
 
     except json.JSONDecodeError:
         logger.error("Invalid JSON in request body")
-        messages_logger.error("ERROR: Invalid JSON in request body")
-        # Update trace with error
-        if trace:
-            try:
-                trace.update(
-                    output=None,
-                    metadata={"status": "error", "error": "Invalid JSON"}
-                )
-            except Exception:
-                pass
+        _log_message("error", "ERROR: Invalid JSON in request body")
+        _update_trace_safe(trace, output=None, metadata={"status": "error", "error": "Invalid JSON"})
         raise HTTPException(status_code=400, detail="Invalid JSON in request body")
     except Exception as e:
         logger.error(f"Error processing request: {e}", exc_info=True)
-        messages_logger.error(f"ERROR: {str(e)}", exc_info=True)
-        # Update trace with error
-        if trace:
-            try:
-                trace.update(
-                    output=None,
-                    metadata={"status": "error", "error": str(e)}
-                )
-            except Exception:
-                pass
+        _log_message("error", f"ERROR: {str(e)}")
+        _update_trace_safe(trace, output=None, metadata={"status": "error", "error": str(e)})
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -282,23 +442,19 @@ async def handle_non_streaming_messages(
             logger.debug(f"Transformed response: {json.dumps(anthropic_response, indent=2)}")
 
             # Update LangFuse trace with output if it was created
-            if trace:
-                try:
-                    trace.update(
-                        output={
-                            "model": anthropic_response.get("model"),
-                            "content": anthropic_response.get("content", []),
-                            "stop_reason": anthropic_response.get("stop_reason"),
-                            "usage": anthropic_response.get("usage", {}),
-                        },
-                        metadata={
-                            "status": "success",
-                            "openrouter_model": settings.get_openrouter_model(anthropic_model),
-                        }
-                    )
-                    # Note: LangFuse client handles async batching, no need to flush here
-                except Exception as e:
-                    logger.warning(f"Failed to update LangFuse trace: {e}")
+            _update_trace_safe(
+                trace,
+                output={
+                    "model": anthropic_response.get("model"),
+                    "content": anthropic_response.get("content", []),
+                    "stop_reason": anthropic_response.get("stop_reason"),
+                    "usage": anthropic_response.get("usage", {}),
+                },
+                metadata={
+                    "status": "success",
+                    "openrouter_model": settings.get_openrouter_model(anthropic_model),
+                }
+            )
 
             return Response(
                 content=json.dumps(anthropic_response),
@@ -307,25 +463,11 @@ async def handle_non_streaming_messages(
 
         except httpx.TimeoutException:
             logger.error("Request to OpenRouter timed out")
-            if trace:
-                try:
-                    trace.update(
-                        output=None,
-                        metadata={"status": "timeout"}
-                    )
-                except Exception:
-                    pass
+            _update_trace_safe(trace, output=None, metadata={"status": "timeout"})
             raise HTTPException(status_code=504, detail="Request to OpenRouter timed out")
         except httpx.RequestError as e:
             logger.error(f"Error connecting to OpenRouter: {e}")
-            if trace:
-                try:
-                    trace.update(
-                        output=None,
-                        metadata={"status": "error", "error": str(e)}
-                    )
-                except Exception:
-                    pass
+            _update_trace_safe(trace, output=None, metadata={"status": "error", "error": str(e)})
             raise HTTPException(status_code=502, detail="Error connecting to OpenRouter")
 
 
@@ -334,6 +476,7 @@ async def stream_messages(
     anthropic_model: str,
     trace: Optional[Any] = None,
     initial_assistant_content: str = "",
+    priming_text_to_strip: str = "",
 ) -> AsyncGenerator[str, None]:
     """
     Stream messages from OpenRouter and convert to Anthropic format.
@@ -342,7 +485,8 @@ async def stream_messages(
         openrouter_request: Transformed request for OpenRouter
         anthropic_model: Original Anthropic model name
         trace: LangFuse trace object (for logging)
-        initial_assistant_content: Priming text from assistant message (e.g., "{" for JSON)
+        initial_assistant_content: Priming text from assistant message (DEPRECATED - not used)
+        priming_text_to_strip: Text to strip from beginning of response (e.g., "{" if client sent assistant priming)
     """
     # Collect streaming metadata
     events_received = 0
@@ -351,9 +495,13 @@ async def stream_messages(
     message_started = False  # Track if we've already sent message_start
     content_block_started = False  # Track if we've already sent content_block_start
     first_delta_received = False  # Track if first delta has been sent
-    accumulated_text = initial_assistant_content  # Start with priming text
-    if initial_assistant_content:
-        messages_logger.info(f"[STREAM] Priming text: {repr(initial_assistant_content)}")
+    first_content_received = False  # Track if we've received first content (for stripping priming)
+    accumulated_text = ""  # Start with empty text (no priming injection)
+    tool_blocks_started = set()  # Track which tool call blocks have already been started (by index)
+
+    if priming_text_to_strip:
+        logger.info(f"Will strip priming text from response start: {repr(priming_text_to_strip)}")
+        _log_message("info", f"Will strip priming text from response: {repr(priming_text_to_strip)}")
 
     async with httpx.AsyncClient(timeout=300.0) as client:
         try:
@@ -372,10 +520,10 @@ async def stream_messages(
                     yield f"event: error\ndata: {json.dumps({'error': error_text.decode()})}\n\n"
                     return
 
-                # Peek at first chunk to decide whether to inject priming text
+                # Peek at first chunk (priming text injection is now DISABLED)
                 first_chunk = None
-                first_delta_content = None
-                should_inject_priming = False
+                # first_delta_content = None  # No longer needed (priming disabled)
+                # should_inject_priming = False  # No longer needed (priming disabled)
 
                 # Read lines from the stream
                 line_iterator = response.aiter_lines()
@@ -390,74 +538,78 @@ async def stream_messages(
 
                         try:
                             first_chunk = json.loads(chunk_str)
-                            # Extract first delta content if available
-                            if "choices" in first_chunk:
-                                choices = first_chunk.get("choices", [])
-                                if choices:
-                                    delta = choices[0].get("delta", {})
-                                    first_delta_content = delta.get("content", "")
+                            # DISABLED: Extract first delta content (no longer needed - priming disabled)
+                            # if "choices" in first_chunk:
+                            #     choices = first_chunk.get("choices", [])
+                            #     if choices:
+                            #         delta = choices[0].get("delta", {})
+                            #         first_delta_content = delta.get("content", "")
 
-                            # Decide whether to inject priming text
-                            # Only inject if model's first delta doesn't start with the priming text
-                            if initial_assistant_content and first_delta_content:
-                                if not first_delta_content.startswith(initial_assistant_content):
-                                    should_inject_priming = True
-                                    messages_logger.info(f"[STREAM] Model's first delta doesn't start with priming text, will inject: {repr(initial_assistant_content)}")
-                                else:
-                                    messages_logger.info(f"[STREAM] Model's first delta already starts with priming text, skipping injection")
-                            elif initial_assistant_content and not first_delta_content:
-                                # No content in first delta, inject priming
-                                should_inject_priming = True
-                                messages_logger.info(f"[STREAM] First delta has no content, will inject priming text")
+                            # DISABLED: Decide whether to inject priming text
+                            # This causes duplicate symbols (e.g., "{{") because OpenRouter
+                            # models already generate the priming text from the assistant message.
+                            # Commenting out to prevent duplication issues.
+                            # if initial_assistant_content and first_delta_content:
+                            #     if not first_delta_content.startswith(initial_assistant_content):
+                            #         should_inject_priming = True
+                            #         _log_message("info", f"[STREAM] Model's first delta doesn't start with priming text, will inject: {repr(initial_assistant_content)}")
+                            #     else:
+                            #         _log_message("info", f"[STREAM] Model's first delta already starts with priming text, skipping injection")
+                            # elif initial_assistant_content and not first_delta_content:
+                            #     # No content in first delta, inject priming
+                            #     should_inject_priming = True
+                            #     _log_message("info", f"[STREAM] First delta has no content, will inject priming text")
 
-                            # Now that we've decided, inject synthetic events if needed
-                            if should_inject_priming:
-                                # Send message_start first
-                                message_start_chunk = {
-                                    "choices": [
-                                        {
-                                            "delta": {"role": "assistant"},
-                                            "finish_reason": None
-                                        }
-                                    ]
-                                }
-                                message_start_event = ResponseTransformer.transform_streaming_chunk(
-                                    message_start_chunk,
-                                    anthropic_model,
-                                    skip_message_start=message_started,
-                                    skip_content_block_start=content_block_started,
-                                )
-                                if message_start_event:
-                                    yield message_start_event
-                                    events_received += 1
-                                    if "message_start" in message_start_event:
-                                        message_started = True
-                                    messages_logger.debug("[STREAM] Injected synthetic message_start")
+                            # DISABLED: Inject synthetic events (was causing duplicate priming text)
+                            # if should_inject_priming:
+                            #     # Send message_start first
+                            #     message_start_chunk = {
+                            #         "choices": [
+                            #             {
+                            #                 "delta": {"role": "assistant"},
+                            #                 "finish_reason": None
+                            #             }
+                            #         ]
+                            #     }
+                            #     message_start_event = ResponseTransformer.transform_streaming_chunk(
+                            #         message_start_chunk,
+                            #         anthropic_model,
+                            #         skip_message_start=message_started,
+                            #         skip_content_block_start=content_block_started,
+                            #     )
+                            #     if message_start_event:
+                            #         yield message_start_event
+                            #         events_received += 1
+                            #         if "message_start" in message_start_event:
+                            #             message_started = True
+                            #         _log_message("debug", "[STREAM] Injected synthetic message_start")
 
-                                # Send priming text as content_block_delta
-                                priming_chunk = {
-                                    "choices": [
-                                        {
-                                            "delta": {"content": initial_assistant_content},
-                                            "finish_reason": None
-                                        }
-                                    ]
-                                }
-                                priming_event = ResponseTransformer.transform_streaming_chunk(
-                                    priming_chunk,
-                                    anthropic_model,
-                                    skip_message_start=True,
-                                    skip_content_block_start=content_block_started,
-                                )
-                                if priming_event:
-                                    yield priming_event
-                                    events_received += 1
-                                    accumulated_text += initial_assistant_content
-                                    if "content_block_start" in priming_event:
-                                        content_block_started = True
-                                    if "content_block_delta" in priming_event:
-                                        first_delta_received = True
-                                    messages_logger.info(f"[STREAM] Injected priming text: {repr(initial_assistant_content)}")
+                            #     # Send priming text as content_block_delta
+                            #     priming_chunk = {
+                            #         "choices": [
+                            #             {
+                            #                 "delta": {"content": initial_assistant_content},
+                            #                 "finish_reason": None
+                            #             }
+                            #         ]
+                            #     }
+                            #     priming_event = ResponseTransformer.transform_streaming_chunk(
+                            #         priming_chunk,
+                            #         anthropic_model,
+                            #         skip_message_start=True,
+                            #         skip_content_block_start=content_block_started,
+                            #     )
+                            #     if priming_event:
+                            #         yield priming_event
+                            #         events_received += 1
+                            #         # if not accumulated_text.startswith('{'):
+                            #         # accumulated_text += initial_assistant_content
+
+                            #         if "content_block_start" in priming_event:
+                            #             content_block_started = True
+                            #         if "content_block_delta" in priming_event:
+                            #             first_delta_received = True
+                            #         _log_message("info", f"[STREAM] Injected priming text: {repr(initial_assistant_content)}")
 
                             # Now process the first chunk we peeked at
                             break
@@ -474,12 +626,25 @@ async def stream_messages(
                         final_usage = first_chunk["usage"]
 
                     # Collect text content from delta chunks
+                    # IMPORTANT: Strip priming text from first content if needed
                     if "choices" in first_chunk:
                         choices = first_chunk.get("choices", [])
                         if choices:
                             delta = choices[0].get("delta", {})
                             if "content" in delta and delta["content"]:
-                                accumulated_text += delta["content"]
+                                content = delta["content"]
+
+                                # Strip priming text from first content chunk
+                                if priming_text_to_strip and not first_content_received:
+                                    if content.startswith(priming_text_to_strip):
+                                        content = content[len(priming_text_to_strip):]
+                                        logger.info(f"Stripped priming text from first chunk: {repr(priming_text_to_strip)}")
+                                        _log_message("info", f"Stripped priming text from first chunk: {repr(priming_text_to_strip)}")
+                                        # Modify the chunk before transformation
+                                        first_chunk["choices"][0]["delta"]["content"] = content
+                                    first_content_received = True
+
+                                accumulated_text += content
 
                     # Transform chunk to Anthropic format
                     anthropic_event = ResponseTransformer.transform_streaming_chunk(
@@ -487,6 +652,7 @@ async def stream_messages(
                         anthropic_model,
                         skip_message_start=message_started,
                         skip_content_block_start=content_block_started,
+                        tool_blocks_started=tool_blocks_started,
                     )
 
                     if anthropic_event:
@@ -503,47 +669,7 @@ async def stream_messages(
                             first_delta_received = True
 
                         # Log streaming event to messages.log
-                        try:
-                            data_match = anthropic_event.split('data: ')
-                            if len(data_match) > 1:
-                                event_data = json.loads(data_match[1].rstrip('\n\n'))
-                                event_type = event_data.get('type', 'unknown')
-
-                                if event_type == 'message_start':
-                                    msg_id = event_data.get('message', {}).get('id')
-                                    usage = event_data.get('message', {}).get('usage', {})
-                                    messages_logger.info(f"[STREAM] message_start - ID: {msg_id}")
-                                    messages_logger.debug(f"  Initial usage: input_tokens={usage.get('input_tokens', 0)}, output_tokens={usage.get('output_tokens', 0)}")
-
-                                elif event_type == 'content_block_start':
-                                    messages_logger.debug(f"[STREAM] content_block_start")
-
-                                elif event_type == 'content_block_delta':
-                                    text = event_data.get('delta', {}).get('text', '')
-                                    if text:
-                                        messages_logger.info(f"[STREAM] content_block_delta - Text: {text}")
-                                    else:
-                                        messages_logger.debug(f"[STREAM] content_block_delta (no text)")
-
-                                elif event_type == 'content_block_stop':
-                                    messages_logger.debug(f"[STREAM] content_block_stop")
-
-                                elif event_type == 'message_delta':
-                                    stop_reason = event_data.get('delta', {}).get('stop_reason')
-                                    usage = event_data.get('usage', {})
-                                    messages_logger.info(f"[STREAM] message_delta - Stop Reason: {stop_reason}")
-                                    messages_logger.debug(f"  Final usage: input_tokens={usage.get('input_tokens', 0)}, output_tokens={usage.get('output_tokens', 0)}, cache_read={usage.get('cache_read_input_tokens', 0)}, cache_creation={usage.get('cache_creation_input_tokens', 0)}")
-
-                                elif event_type == 'message_stop':
-                                    messages_logger.debug(f"[STREAM] message_stop")
-
-                                else:
-                                    messages_logger.info(f"[STREAM] {event_type}")
-                            else:
-                                messages_logger.debug(f"[STREAM] Event: {anthropic_event}")
-                        except Exception as log_error:
-                            logger.debug(f"Error logging stream event: {log_error}")
-                            messages_logger.debug(f"[STREAM] Event (raw): {anthropic_event}")
+                        _log_stream_event(anthropic_event)
 
                         yield anthropic_event
                         events_received += 1
@@ -567,6 +693,7 @@ async def stream_messages(
                                     skip_message_start=message_started,
                                     skip_content_block_start=content_block_started,
                                     accumulated_usage=final_usage,
+                                    tool_blocks_started=tool_blocks_started,
                                 )
                                 if anthropic_event:
                                     yield anthropic_event
@@ -583,12 +710,25 @@ async def stream_messages(
                                 logger.debug(f"Collected usage from chunk: {final_usage}")
 
                             # Collect text content from delta chunks
+                            # IMPORTANT: Strip priming text from first content if needed
                             if "choices" in openrouter_chunk:
                                 choices = openrouter_chunk.get("choices", [])
                                 if choices:
                                     delta = choices[0].get("delta", {})
                                     if "content" in delta and delta["content"]:
-                                        accumulated_text += delta["content"]
+                                        content = delta["content"]
+
+                                        # Strip priming text from first content chunk
+                                        if priming_text_to_strip and not first_content_received:
+                                            if content.startswith(priming_text_to_strip):
+                                                content = content[len(priming_text_to_strip):]
+                                                logger.info(f"Stripped priming text from chunk: {repr(priming_text_to_strip)}")
+                                                _log_message("info", f"Stripped priming text from chunk: {repr(priming_text_to_strip)}")
+                                                # Modify the chunk before transformation
+                                                openrouter_chunk["choices"][0]["delta"]["content"] = content
+                                            first_content_received = True
+
+                                        accumulated_text += content
 
                             # Check if this chunk has finish_reason (indicates end of stream)
                             has_finish_reason = False
@@ -607,6 +747,7 @@ async def stream_messages(
                                     skip_message_start=message_started,
                                     skip_content_block_start=content_block_started,
                                     accumulated_usage=final_usage,
+                                    tool_blocks_started=tool_blocks_started,
                                 )
                                 if anthropic_event:
                                     yield anthropic_event
@@ -624,6 +765,7 @@ async def stream_messages(
                                     skip_message_start=message_started,
                                     skip_content_block_start=content_block_started,
                                     accumulated_usage=final_usage,
+                                    tool_blocks_started=tool_blocks_started,
                                 )
                                 if anthropic_event:
                                     yield anthropic_event
@@ -642,6 +784,7 @@ async def stream_messages(
                                 anthropic_model,
                                 skip_message_start=message_started,
                                 skip_content_block_start=content_block_started,
+                                tool_blocks_started=tool_blocks_started,
                             )
 
                             if anthropic_event:
@@ -658,48 +801,7 @@ async def stream_messages(
                                     first_delta_received = True
 
                                 # Log streaming event to messages.log
-                                # Extract event type and data from the SSE line
-                                try:
-                                    data_match = anthropic_event.split('data: ')
-                                    if len(data_match) > 1:
-                                        event_data = json.loads(data_match[1].rstrip('\n\n'))
-                                        event_type = event_data.get('type', 'unknown')
-
-                                        if event_type == 'message_start':
-                                            msg_id = event_data.get('message', {}).get('id')
-                                            usage = event_data.get('message', {}).get('usage', {})
-                                            messages_logger.info(f"[STREAM] message_start - ID: {msg_id}")
-                                            messages_logger.debug(f"  Initial usage: input_tokens={usage.get('input_tokens', 0)}, output_tokens={usage.get('output_tokens', 0)}")
-
-                                        elif event_type == 'content_block_start':
-                                            messages_logger.debug(f"[STREAM] content_block_start")
-
-                                        elif event_type == 'content_block_delta':
-                                            text = event_data.get('delta', {}).get('text', '')
-                                            if text:
-                                                messages_logger.info(f"[STREAM] content_block_delta - Text: {text}")
-                                            else:
-                                                messages_logger.debug(f"[STREAM] content_block_delta (no text)")
-
-                                        elif event_type == 'content_block_stop':
-                                            messages_logger.debug(f"[STREAM] content_block_stop")
-
-                                        elif event_type == 'message_delta':
-                                            stop_reason = event_data.get('delta', {}).get('stop_reason')
-                                            usage = event_data.get('usage', {})
-                                            messages_logger.info(f"[STREAM] message_delta - Stop Reason: {stop_reason}")
-                                            messages_logger.debug(f"  Final usage: input_tokens={usage.get('input_tokens', 0)}, output_tokens={usage.get('output_tokens', 0)}, cache_read={usage.get('cache_read_input_tokens', 0)}, cache_creation={usage.get('cache_creation_input_tokens', 0)}")
-
-                                        elif event_type == 'message_stop':
-                                            messages_logger.debug(f"[STREAM] message_stop")
-
-                                        else:
-                                            messages_logger.info(f"[STREAM] {event_type}")
-                                    else:
-                                        messages_logger.debug(f"[STREAM] Event: {anthropic_event}")
-                                except Exception as log_error:
-                                    logger.debug(f"Error logging stream event: {log_error}")
-                                    messages_logger.debug(f"[STREAM] Event (raw): {anthropic_event}")
+                                _log_stream_event(anthropic_event)
 
                                 yield anthropic_event
                                 events_received += 1
@@ -714,78 +816,70 @@ async def stream_messages(
                 logger.info(f"Stream completed: {events_received} events, trace: {trace is not None}")
 
                 # Log stream summary to messages.log
-                messages_logger.info("=" * 80)
-                messages_logger.info("STREAMING RESPONSE COMPLETED")
-                messages_logger.info(f"Total Events: {events_received}")
-                messages_logger.info(f"Total Text Characters: {len(accumulated_text)}")
+                _log_message("info", "=" * 80)
+                _log_message("info", "STREAMING RESPONSE COMPLETED")
+                _log_message("info", f"Total Events: {events_received}")
+                _log_message("info", f"Total Text Characters: {len(accumulated_text)}")
                 if final_usage:
-                    messages_logger.info(f"Final Usage: {final_usage}")
-                messages_logger.info("=" * 80)
+                    _log_message("info", f"Final Usage: {final_usage}")
+                _log_message("info", "=" * 80)
 
+                logger.debug(f"Updating trace with output: events={events_received}, text length={len(accumulated_text)}, usage={final_usage}")
+                _update_trace_safe(
+                    trace,
+                    output={
+                        "model": anthropic_model,
+                        "content": [{"type": "text", "text": accumulated_text}],  # Match non-streaming format
+                        "stop_reason": "end_turn",  # Streaming completed successfully
+                        "usage": final_usage if final_usage else {},
+                    },
+                    metadata={
+                        "status": "streaming_completed",
+                        "events_count": events_received,
+                        "text_length": len(accumulated_text),
+                    }
+                )
                 if trace:
-                    try:
-                        logger.debug(f"Updating trace with output: events={events_received}, text length={len(accumulated_text)}, usage={final_usage}")
-                        trace.update(
-                            output={
-                                "events_received": events_received,
-                                "text": accumulated_text,
-                                "usage": final_usage,
-                            },
-                            metadata={
-                                "status": "streaming_completed",
-                                "events_count": events_received,
-                                "text_length": len(accumulated_text),
-                            }
-                        )
-                        logger.info(f"Trace updated successfully for streaming request with {len(accumulated_text)} chars")
-                        # Note: DO NOT call flush() here - it's blocking and will freeze streaming
-                    except Exception as e:
-                        logger.error(f"Failed to update LangFuse trace: {e}", exc_info=True)
+                    logger.info(f"Trace updated successfully for streaming request with {len(accumulated_text)} chars")
 
         except httpx.TimeoutException:
             logger.error("Request to OpenRouter timed out during streaming")
-            if trace:
-                try:
-                    trace.update(
-                        output={
-                            "events_received": events_received,
-                            "text": accumulated_text,
-                            "text_length": len(accumulated_text),
-                        },
-                        metadata={"status": "timeout", "text_partial": len(accumulated_text) > 0}
-                    )
-                except Exception:
-                    pass
+            _update_trace_safe(
+                trace,
+                output={
+                    "model": anthropic_model,
+                    "content": [{"type": "text", "text": accumulated_text}] if accumulated_text else [],
+                    "stop_reason": "timeout",
+                    "usage": final_usage if final_usage else {},
+                },
+                metadata={"status": "timeout", "text_partial": len(accumulated_text) > 0}
+            )
             yield f"event: error\ndata: {json.dumps({'error': 'Request timed out'})}\n\n"
         except httpx.RequestError as e:
             logger.error(f"Error connecting to OpenRouter: {e}")
-            if trace:
-                try:
-                    trace.update(
-                        output={
-                            "events_received": events_received,
-                            "text": accumulated_text,
-                            "text_length": len(accumulated_text),
-                        },
-                        metadata={"status": "connection_error", "error": str(e), "text_partial": len(accumulated_text) > 0}
-                    )
-                except Exception:
-                    pass
+            _update_trace_safe(
+                trace,
+                output={
+                    "model": anthropic_model,
+                    "content": [{"type": "text", "text": accumulated_text}] if accumulated_text else [],
+                    "stop_reason": "error",
+                    "usage": final_usage if final_usage else {},
+                },
+                metadata={"status": "connection_error", "error": str(e), "text_partial": len(accumulated_text) > 0}
+            )
             yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
         except Exception as e:
             logger.error(f"Unexpected error during streaming: {e}", exc_info=True)
-            if trace:
-                try:
-                    trace.update(
-                        output={
-                            "events_received": events_received,
-                            "text": accumulated_text,
-                            "text_length": len(accumulated_text),
-                        },
-                        metadata={"status": "error", "error": str(e), "text_partial": len(accumulated_text) > 0}
-                    )
-                except Exception:
-                    pass
+            _update_trace_safe(
+                trace,
+                output={
+                    "model": anthropic_model,
+                    "content": [{"type": "text", "text": accumulated_text}] if accumulated_text else [],
+                    "stop_reason": "error",
+                    "usage": final_usage if final_usage else {},
+                },
+                metadata={"status": "error", "error": str(e), "text_partial": len(accumulated_text) > 0}
+            )
             yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
 
 

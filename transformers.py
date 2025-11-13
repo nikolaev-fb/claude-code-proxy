@@ -282,6 +282,7 @@ class ResponseTransformer:
         skip_message_start: bool = False,
         skip_content_block_start: bool = False,
         accumulated_usage: Optional[Dict[str, Any]] = None,
+        tool_blocks_started: Optional[set] = None,
     ) -> Optional[str]:
         """
         Convert OpenRouter streaming chunk to Anthropic SSE event format.
@@ -292,10 +293,14 @@ class ResponseTransformer:
             skip_message_start: If True, skip message_start event (already sent)
             skip_content_block_start: If True, skip content_block_start event (already sent)
             accumulated_usage: Usage data collected from previous chunks (for finish events)
+            tool_blocks_started: Set of tool call indices that have already sent content_block_start
 
         Returns:
             Anthropic-style SSE event (string) or None if this is a keep-alive
         """
+        # Initialize tool_blocks_started if not provided
+        if tool_blocks_started is None:
+            tool_blocks_started = set()
         # Skip keep-alive comments
         if "choices" not in openrouter_chunk:
             return None
@@ -338,8 +343,8 @@ class ResponseTransformer:
             for idx, tool_call in enumerate(delta["tool_calls"]):
                 tool_index = tool_call.get("index", idx)
 
-                # If this is a new tool call (has id), send content_block_start
-                if "id" in tool_call:
+                # If this is a new tool call (has id) and we haven't started this block yet, send content_block_start
+                if "id" in tool_call and tool_index not in tool_blocks_started:
                     content_block_event = {
                         "type": "content_block_start",
                         "index": tool_index,
@@ -351,6 +356,8 @@ class ResponseTransformer:
                         },
                     }
                     output += f"event: content_block_start\ndata: {json.dumps(content_block_event)}\n\n"
+                    # Mark this tool block as started
+                    tool_blocks_started.add(tool_index)
 
                 # If there are arguments, send content_block_delta with input_json_delta
                 if "function" in tool_call and "arguments" in tool_call["function"]:

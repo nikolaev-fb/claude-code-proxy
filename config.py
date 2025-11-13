@@ -24,6 +24,9 @@ class Settings:
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
     LOG_FORMAT: str = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 
+    # File Logging Configuration (Optional)
+    FILE_LOGGING_ENABLED: bool = os.getenv("FILE_LOGGING_ENABLED", "false").lower() == "true"
+
     # LangFuse Configuration (Optional)
     LANGFUSE_ENABLED: bool = os.getenv("LANGFUSE_ENABLED", "false").lower() == "true"
     LANGFUSE_API_KEY: Optional[str] = os.getenv("LANGFUSE_API_KEY")
