@@ -27,7 +27,7 @@ Claude Code → This Proxy → OpenRouter → Your Chosen Model
 ### 1. Clone the Repository
 
 ```bash
-git clone <your-repo-url>
+git clone https://github.com/nikolaev-fb/claude-code-proxy
 cd claude-code-proxy
 ```
 
