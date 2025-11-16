@@ -10,7 +10,7 @@ A lightweight proxy server that translates Anthropic API requests to OpenRouter 
 
 This proxy sits between Claude Code and OpenRouter, allowing you to:
 
-- Use kimi-k2 models trought **OpenRouter models** (other models not tested)
+- Use kimi-k2 models through **OpenRouter models** (other models not tested)
 - Keep using the familiar Claude Code interface
 - Support streaming, tool calls and thinking mode
 - Log conversations for debugging (optional)
@@ -115,10 +115,10 @@ When enabled, all requests and responses are saved to `logs/messages.log`. This 
 - Log files can become several MB in minutes with streaming responses
 - Contains full conversation history (including system prompts)
 
-Enabling logging allows you to log all opentrouter streaming responses into file `logs/opentrouter-streaming.log`
+Enabling logging allows you to log all openrouter streaming responses into file `logs/openrouter-streaming.log`
 And all transformed anthropic responses into `logs/anthropic-streaming.log`
 
-it is recommended to use langfuse to log all traces and enable file logging ony if you want to change the code of this proxy.
+it is recommended to use langfuse to log all traces and enable file logging only if you want to change the code of this proxy.
 
 ### LangFuse Integration
 
@@ -138,7 +138,7 @@ LANGFUSE_HOST=http://localhost:3000
 - ✅ Streaming responses (real-time)
 - ✅ Non-streaming responses
 - ✅ Tool/function calling support
-- ✅ Thinking mode support support
+- ✅ Thinking mode support
 - ✅ Token usage tracking
 - ✅ Error handling & logging
 - ✅ LangFuse integration
@@ -158,9 +158,15 @@ LANGFUSE_HOST=http://localhost:3000
 
 ## Support & Contributing
 
-- **Issues**: Feel free to create new PR
-- **OpenRouter Docs**: https://openrouter.ai/docs
-- **Claude Code Docs**: https://docs.claude.com/claude-code
+Contributions are welcome! Please:
+
+- **Submit Pull Requests**: Open an issue first with a detailed description and explain why the change is necessary
+- **Test Models**: Try different OpenRouter models and share your results
+- **Improve Documentation**: Help make the documentation clearer
+
+**Useful Resources**:
+- OpenRouter Docs: https://openrouter.ai/docs
+- Claude Code Docs: https://docs.claude.com/claude-code
 
 ---
 
