@@ -10,14 +10,13 @@ A lightweight proxy server that translates Anthropic API requests to OpenRouter 
 
 This proxy sits between Claude Code and OpenRouter, allowing you to:
 
-- Use **OpenRouter models** (GPT-4, Claude, Gemini, Llama, etc.) with Claude Code
+- Use kimi-k2 models trought **OpenRouter models** (other models not tested)
 - Keep using the familiar Claude Code interface
-- Switch between models easily via configuration
-- Stream responses in real-time
+- Support streaming, tool calls and thinking mode
 - Log conversations for debugging (optional)
 
 ```
-Claude Code → This Proxy → OpenRouter → Your Chosen Model
+Claude Code → This Proxy → OpenRouter → OpenRouter style Response → Transform → Anthropic style response → Claude Code
 ```
 
 ---
@@ -74,9 +73,9 @@ Run the claude code with openrouter api endpoint and model
 ```bash
 # Set the base URL to your proxy
 ANTHROPIC_BASE_URL="http://localhost:3002" && \
-ANTHROPIC_MODEL="moonshotai/kimi-k2-0905" && \
+ANTHROPIC_MODEL="moonshotai/kimi-k2-thinking" && \
 ANTHROPIC_DEFAULT_HAIKU_MODEL="moonshotai/kimi-k2-0905" && \
-ANTHROPIC_DEFAULT_SONNET_MODEL="moonshotai/kimi-k2-0905" && \
+ANTHROPIC_DEFAULT_SONNET_MODEL="moonshotai/kimi-k2-thinking" && \
 CLAUDE_CODE_DISABLE_TELEMETRY="true" && \
 claude
 ```
@@ -106,7 +105,7 @@ OPENROUTER_API_KEY=sk-or-v1-...
 **⚠ Warning: Log files can grow very quickly!**
 
 ```bash
-# Enable logging to logs/messages.log
+# Enable logging
 FILE_LOGGING_ENABLED=true
 ```
 
@@ -116,7 +115,12 @@ When enabled, all requests and responses are saved to `logs/messages.log`. This 
 - Log files can become several MB in minutes with streaming responses
 - Contains full conversation history (including system prompts)
 
-### LangFuse Integration (Optional)
+Enabling logging allows you to log all opentrouter streaming responses into file `logs/opentrouter-streaming.log`
+And all transformed anthropic responses into `logs/anthropic-streaming.log`
+
+it is recommended to use langfuse to log all traces and enable file logging ony if you want to change the code of this proxy.
+
+### LangFuse Integration
 
 If you're running [LangFuse](https://langfuse.com) locally for observability:
 
@@ -131,24 +135,24 @@ LANGFUSE_HOST=http://localhost:3000
 
 ## Features
 
-✅ Streaming responses (real-time)
-✅ Non-streaming responses
-✅ Automatic model mapping
-✅ Tool/function calling support
-✅ System prompt conversion
-✅ Token usage tracking
-✅ Error handling & logging
-✅ Optional LangFuse integration
+- ✅ Streaming responses (real-time)
+- ✅ Non-streaming responses
+- ✅ Tool/function calling support
+- ✅ Thinking mode support support
+- ✅ Token usage tracking
+- ✅ Error handling & logging
+- ✅ LangFuse integration
 
 ---
 
 ## Known Limitations
 
 - This is an **experimental project** - expect bugs!
+- Only kimi-k2 models were tested 
 - Some Anthropic features may not work perfectly with all OpenRouter models
-- Rate limits depend on your OpenRouter plan
 - File uploads not yet supported
 - Batch API not implemented
+- Skills feature is not supported
 
 ---
 
@@ -162,6 +166,6 @@ LANGFUSE_HOST=http://localhost:3000
 
 ## License
 
-MIT License - feel free to modify and use as needed!
+MIT License - feel free to modify and use as needed
 
 ---

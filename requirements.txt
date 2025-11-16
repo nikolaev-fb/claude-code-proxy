@@ -4,4 +4,4 @@ httpx==0.28.1
 python-dotenv==1.1.0
 pydantic==2.12.1
 pydantic-settings==2.11.0
-langfuse==2.60.2
+langfuse==3.10.0

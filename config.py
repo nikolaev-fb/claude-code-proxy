@@ -27,6 +27,9 @@ class Settings:
     # File Logging Configuration (Optional)
     FILE_LOGGING_ENABLED: bool = os.getenv("FILE_LOGGING_ENABLED", "false").lower() == "true"
 
+    # Streaming Configuration
+    STREAMING_V2_ENABLED: bool = os.getenv("STREAMING_V2_ENABLED", "true").lower() == "true"
+
     # LangFuse Configuration (Optional)
     LANGFUSE_ENABLED: bool = os.getenv("LANGFUSE_ENABLED", "false").lower() == "true"
     LANGFUSE_API_KEY: Optional[str] = os.getenv("LANGFUSE_API_KEY")

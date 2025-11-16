@@ -78,6 +78,18 @@ class RequestTransformer:
         if anthropic_request.get("stream"):
             openrouter_request["stream_options"] = {"include_usage": True}
 
+        # Handle thinking/reasoning parameter for Kimi model
+        # Anthropic format: "thinking": {"type": "enabled", "budget_tokens": 16000}
+        # OpenRouter format for Kimi: "extra_body": {"reasoning": {"enabled": true}}
+        if "thinking" in anthropic_request:
+            thinking = anthropic_request["thinking"]
+            if isinstance(thinking, dict) and thinking.get("type") == "enabled":
+                openrouter_request["extra_body"] = {
+                    "reasoning": {
+                        "enabled": True
+                    }
+                }
+
         return openrouter_request
 
     @staticmethod
@@ -466,6 +478,241 @@ class ResponseTransformer:
         import secrets
         random_str = secrets.token_hex(12)  # 24 character hex string
         return f"msg_{random_str}"
+
+
+    @staticmethod
+    def transform_streaming_chunk_v2(
+        openrouter_chunk: Dict[str, Any],
+        original_model: str,
+        content_blocks_state: Dict[str, Any],
+        accumulated_usage: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        """
+        V2: Convert OpenRouter streaming chunk to Anthropic SSE format with proper multi-block handling.
+
+        Improvements over V1:
+        - Handles Kimi reasoning (delta.reasoning) → thinking blocks
+        - Better tool call handling
+        - Proper state management for multiple simultaneous content blocks
+        - Guaranteed correct event ordering
+
+        Args:
+            openrouter_chunk: Streaming chunk from OpenRouter
+            original_model: Original model name
+            content_blocks_state: State dict (modified in-place):
+                {
+                    "next_index": 0,  # Next available Anthropic block index
+                    "thinking": {"started": bool, "index": int, "stopped": bool},
+                    "text": {"started": bool, "index": int, "stopped": bool},
+                    "tool_calls": {openrouter_index: {"started": bool, "index": int, "id": str, "name": str, "accumulated_arguments": str, "stopped": bool}}
+                }
+            accumulated_usage: Usage data from previous chunks
+
+        Returns:
+            Anthropic-style SSE event string (or None if nothing to emit)
+        """
+        # Skip chunks without choices (keepalive comments)
+        if "choices" not in openrouter_chunk:
+            return None
+
+        choices = openrouter_chunk.get("choices", [])
+        if not choices:
+            return None
+
+        choice = choices[0]
+        delta = choice.get("delta", {})
+        finish_reason = choice.get("finish_reason")
+
+        output = ""
+
+        # 1. THINKING BLOCKS (Kimi reasoning)
+        # Kimi sends: delta.reasoning with incremental reasoning text
+        if "reasoning" in delta and delta["reasoning"]:
+            thinking_state = content_blocks_state.get("thinking", {})
+
+            # Send content_block_start if not started yet
+            if not thinking_state.get("started"):
+                thinking_index = content_blocks_state["next_index"]
+                content_blocks_state["next_index"] += 1
+                content_blocks_state["thinking"] = {
+                    "started": True,
+                    "index": thinking_index,
+                    "stopped": False
+                }
+
+                start_event = {
+                    "type": "content_block_start",
+                    "index": thinking_index,
+                    "content_block": {
+                        "type": "thinking",
+                        "thinking": ""
+                    }
+                }
+                output += f"event: content_block_start\ndata: {json.dumps(start_event)}\n\n"
+
+            # Send content_block_delta with thinking_delta
+            thinking_index = content_blocks_state["thinking"]["index"]
+            delta_event = {
+                "type": "content_block_delta",
+                "index": thinking_index,
+                "delta": {
+                    "type": "thinking_delta",
+                    "thinking": delta["reasoning"]
+                }
+            }
+            output += f"event: content_block_delta\ndata: {json.dumps(delta_event)}\n\n"
+
+        # 2. TOOL USE BLOCKS
+        # OpenRouter sends: delta.tool_calls with array of tool call deltas
+        if "tool_calls" in delta and delta["tool_calls"]:
+            tool_calls_state = content_blocks_state.setdefault("tool_calls", {})
+
+            for tool_call_delta in delta["tool_calls"]:
+                tool_index = tool_call_delta.get("index", 0)
+
+                # Initialize state for this tool call if needed
+                if tool_index not in tool_calls_state:
+                    tool_calls_state[tool_index] = {
+                        "started": False,
+                        "index": None,
+                        "id": None,
+                        "name": None,
+                        "accumulated_arguments": "",  # Accumulate JSON arguments
+                        "stopped": False
+                    }
+
+                tool_state = tool_calls_state[tool_index]
+
+                # Send content_block_start if this tool call has an ID (first chunk)
+                if "id" in tool_call_delta and not tool_state["started"]:
+                    anthropic_index = content_blocks_state["next_index"]
+                    content_blocks_state["next_index"] += 1
+
+                    tool_state["started"] = True
+                    tool_state["index"] = anthropic_index
+                    tool_state["id"] = tool_call_delta["id"]
+                    tool_state["name"] = tool_call_delta.get("function", {}).get("name", "")
+
+                    start_event = {
+                        "type": "content_block_start",
+                        "index": anthropic_index,
+                        "content_block": {
+                            "type": "tool_use",
+                            "id": tool_state["id"],
+                            "name": tool_state["name"],
+                            "input": {}
+                        }
+                    }
+                    output += f"event: content_block_start\ndata: {json.dumps(start_event)}\n\n"
+
+                # Send content_block_delta with input_json_delta for arguments
+                if "function" in tool_call_delta and "arguments" in tool_call_delta["function"]:
+                    anthropic_index = tool_state["index"]
+                    arguments = tool_call_delta["function"]["arguments"]
+
+                    if arguments:  # Only send if there's actual content
+                        # Accumulate arguments for later (for LangFuse logging)
+                        tool_state["accumulated_arguments"] += arguments
+
+                        delta_event = {
+                            "type": "content_block_delta",
+                            "index": anthropic_index,
+                            "delta": {
+                                "type": "input_json_delta",
+                                "partial_json": arguments
+                            }
+                        }
+                        output += f"event: content_block_delta\ndata: {json.dumps(delta_event)}\n\n"
+
+        # 3. TEXT CONTENT BLOCKS
+        # OpenRouter sends: delta.content with text
+        if "content" in delta and delta["content"]:
+            text_state = content_blocks_state.get("text", {})
+
+            # Send content_block_start if not started yet
+            if not text_state.get("started"):
+                text_index = content_blocks_state["next_index"]
+                content_blocks_state["next_index"] += 1
+                content_blocks_state["text"] = {
+                    "started": True,
+                    "index": text_index,
+                    "stopped": False
+                }
+
+                start_event = {
+                    "type": "content_block_start",
+                    "index": text_index,
+                    "content_block": {
+                        "type": "text",
+                        "text": ""
+                    }
+                }
+                output += f"event: content_block_start\ndata: {json.dumps(start_event)}\n\n"
+
+            # Send content_block_delta with text_delta
+            text_index = content_blocks_state["text"]["index"]
+            delta_event = {
+                "type": "content_block_delta",
+                "index": text_index,
+                "delta": {
+                    "type": "text_delta",
+                    "text": delta["content"]
+                }
+            }
+            output += f"event: content_block_delta\ndata: {json.dumps(delta_event)}\n\n"
+
+        # 4. FINISH EVENTS (content_block_stop, message_delta, message_stop)
+        if finish_reason is not None:
+            stop_reason = ResponseTransformer._map_finish_reason(finish_reason)
+
+            # Send content_block_stop for all started blocks
+            # Order: thinking, text, tool_calls (by index)
+            for block_type in ["thinking", "text"]:
+                block_state = content_blocks_state.get(block_type, {})
+                if block_state.get("started") and not block_state.get("stopped"):
+                    stop_event = {
+                        "type": "content_block_stop",
+                        "index": block_state["index"]
+                    }
+                    output += f"event: content_block_stop\ndata: {json.dumps(stop_event)}\n\n"
+                    block_state["stopped"] = True
+
+            # Stop all tool call blocks
+            tool_calls_state = content_blocks_state.get("tool_calls", {})
+            for tool_idx in sorted(tool_calls_state.keys()):
+                tool_state = tool_calls_state[tool_idx]
+                if tool_state.get("started") and not tool_state.get("stopped"):
+                    stop_event = {
+                        "type": "content_block_stop",
+                        "index": tool_state["index"]
+                    }
+                    output += f"event: content_block_stop\ndata: {json.dumps(stop_event)}\n\n"
+                    tool_state["stopped"] = True
+
+            # Send message_delta with usage
+            usage = accumulated_usage if accumulated_usage else openrouter_chunk.get("usage", {})
+            prompt_tokens_details = usage.get("prompt_tokens_details") or {}
+
+            message_delta_event = {
+                "type": "message_delta",
+                "delta": {
+                    "stop_reason": stop_reason,
+                    "stop_sequence": None
+                },
+                "usage": {
+                    "input_tokens": usage.get("prompt_tokens", 0),
+                    "output_tokens": usage.get("completion_tokens", 0),
+                    "cache_read_input_tokens": prompt_tokens_details.get("cached_tokens", 0),
+                    "cache_creation_input_tokens": prompt_tokens_details.get("cache_creation_input_tokens", 0)
+                }
+            }
+            output += f"event: message_delta\ndata: {json.dumps(message_delta_event)}\n\n"
+
+            # Send message_stop
+            message_stop_event = {"type": "message_stop"}
+            output += f"event: message_stop\ndata: {json.dumps(message_stop_event)}\n\n"
+
+        return output if output else None
 
 
 class ModelsResponseTransformer:
