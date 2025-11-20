@@ -10,11 +10,12 @@ load_dotenv()
 
 import logging
 import json
-from typing import AsyncGenerator, Dict, Any, Optional
+from typing import AsyncGenerator, Dict, Any, Optional, List
 import asyncio
 import os
 from datetime import datetime
 from contextlib import asynccontextmanager
+import hashlib
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException, Response
@@ -27,6 +28,45 @@ from transformers import (
     ResponseTransformer,
     ModelsResponseTransformer,
 )
+
+# Simple cache for reasoning_details: {message_content_hash: reasoning_details}
+# Strategy: Cache by the assistant message content itself, so we can retrieve
+# reasoning_details when that same assistant message appears in follow-up requests
+reasoning_cache = {}
+
+
+def get_message_content_hash(message: Dict[str, Any]) -> str:
+    """
+    Generate hash from a single message's content to uniquely identify it.
+
+    This allows us to cache reasoning_details keyed by the assistant message
+    content, so we can inject them when that message appears in future requests.
+
+    Args:
+        message: Single message dict (typically assistant message)
+
+    Returns:
+        SHA-256 hash string identifying the message content
+    """
+    # Extract just the content for hashing (ignore role and other metadata)
+    content = message.get("content", "")
+
+    # Handle both string and array content formats
+    if isinstance(content, list):
+        # For array content, extract text from each block
+        text_parts = []
+        for block in content:
+            if isinstance(block, dict):
+                if block.get("type") == "text":
+                    text_parts.append(block.get("text", ""))
+                elif block.get("type") == "tool_use":
+                    # Include tool use in hash for uniqueness
+                    text_parts.append(f"tool:{block.get('name')}:{json.dumps(block.get('input', {}))}")
+        content_str = "|".join(text_parts)
+    else:
+        content_str = str(content)
+
+    return hashlib.sha256(content_str.encode()).hexdigest()
 
 # Configure logging
 logging.basicConfig(
@@ -579,7 +619,7 @@ async def messages(request: Request) -> Response:
                 async def streaming_wrapper():
                     """Wrapper to maintain LangFuse context during streaming."""
                     try:
-                        async for chunk in stream_messages_v2(openrouter_request, anthropic_model, generation, priming_text_to_strip):
+                        async for chunk in stream_messages_v2(openrouter_request, anthropic_model, generation, priming_text_to_strip, request_body.get("messages", [])):
                             yield chunk
                     finally:
                         # Exit the context manager properly (don't call generation.end() separately)
@@ -677,6 +717,17 @@ async def handle_non_streaming_messages(
     """
     async with httpx.AsyncClient(timeout=300.0) as client:
         try:
+            # HARDCODED FIX: Remove "usage" field for Google Gemini models
+            current_model = openrouter_request.get("model", "")
+            if current_model.startswith("google/gemini-"):
+                if "usage" in openrouter_request:
+                    logger.info(f"Removing 'usage' field from request for Gemini model: {current_model}")
+                    # openrouter_request.pop("usage")
+                    # openrouter_request.pop("max_output_tokens")
+                    # openrouter_request.pop("top_p")
+                    # openrouter_request.pop("max_tokens")
+                    # openrouter_request.pop("max_tokens")
+
             # Call OpenRouter API
             response = await client.post(
                 f"{settings.OPENROUTER_BASE_URL}/chat/completions",
@@ -696,6 +747,18 @@ async def handle_non_streaming_messages(
 
             openrouter_response = response.json()
             logger.debug(f"OpenRouter response: {json.dumps(openrouter_response, indent=2)}")
+
+            # Capture reasoning_details if present (for models like google/gemini-3-pro-preview)
+            if "choices" in openrouter_response and openrouter_response["choices"]:
+                message = openrouter_response["choices"][0].get("message", {})
+                reasoning_details = message.get("reasoning_details")
+                if reasoning_details:
+                    # Cache by the assistant message content itself
+                    # This allows us to inject reasoning_details when this same message
+                    # appears in follow-up requests (e.g., with tool results)
+                    msg_hash = get_message_content_hash({"content": message.get("content", "")})
+                    reasoning_cache[msg_hash] = reasoning_details
+                    logger.info(f"Cached reasoning_details for message {msg_hash[:8]}... (non-streaming)")
 
             # Transform response back to Anthropic format
             anthropic_response = ResponseTransformer.transform_messages_response(
@@ -1195,6 +1258,7 @@ async def stream_messages_v2(
     anthropic_model: str,
     generation: Optional[Any] = None,
     priming_text_to_strip: str = "",
+    original_messages: Optional[List[Dict[str, Any]]] = None,
 ) -> AsyncGenerator[str, None]:
     """
     V2: Stream messages with proper Anthropic SSE event structure.
@@ -1210,6 +1274,7 @@ async def stream_messages_v2(
         anthropic_model: Original Anthropic model name
         generation: LangFuse generation object (for logging)
         priming_text_to_strip: Text to strip from beginning of response
+        original_messages: Original Anthropic messages (for conversation hashing)
     """
     # Stream metadata
     events_received = 0
@@ -1218,6 +1283,7 @@ async def stream_messages_v2(
     first_content_received = False
     accumulated_text = ""
     accumulated_reasoning = ""
+    delta_reasoning_details = None  # Store reasoning_details if it appears in delta (JSON format)
     actual_stop_reason = "end_turn"  # Will be updated from finish chunk
 
     # Usage waiting state (OpenRouter sends usage AFTER finish_reason)
@@ -1356,9 +1422,22 @@ async def stream_messages_v2(
 
                                         accumulated_text += content
 
-                                    # Accumulate reasoning for logging
+                                    # Accumulate reasoning (text format)
                                     if "reasoning" in delta and delta["reasoning"]:
                                         accumulated_reasoning += delta["reasoning"]
+
+                                    # Capture reasoning_details if present (JSON format - preferred for caching)
+                                    if "reasoning_details" in delta and delta["reasoning_details"]:
+                                        delta_reasoning_details = delta["reasoning_details"]
+                                        logger.debug(f"Captured reasoning_details from delta: {delta_reasoning_details}")
+
+                                        # If reasoning_details has an id field (e.g., for tool calls), cache by tool call ID
+                                        # This allows us to attach reasoning when the tool call appears in follow-up requests
+                                        for reasoning_item in delta_reasoning_details:
+                                            if isinstance(reasoning_item, dict) and "id" in reasoning_item:
+                                                tool_call_id = reasoning_item["id"]
+                                                reasoning_cache[f"tool_call:{tool_call_id}"] = delta_reasoning_details
+                                                logger.info(f"Cached reasoning_details for tool_call {tool_call_id[:20]}...")
 
                             # Transform chunk using V2 transformer
                             anthropic_event = ResponseTransformer.transform_streaming_chunk_v2(
@@ -1472,6 +1551,30 @@ async def stream_messages_v2(
                             "name": tool_state.get("name", ""),
                             "input": input_data
                         })
+
+                # Cache reasoning_details (for models like google/gemini-3-pro-preview)
+                # PREFER delta_reasoning_details (JSON format) over accumulated_reasoning (text)
+                reasoning_details_to_cache = None
+
+                if delta_reasoning_details:
+                    # Use reasoning_details from delta (JSON format - exact format from OpenRouter)
+                    reasoning_details_to_cache = delta_reasoning_details
+                    logger.info(f"Using reasoning_details from delta (JSON format)")
+                elif accumulated_reasoning:
+                    # Fallback: Structure accumulated reasoning text as reasoning_details
+                    reasoning_details_to_cache = [{
+                        "type": "reasoning",
+                        "content": accumulated_reasoning
+                    }]
+                    logger.info(f"Using accumulated reasoning text (fallback)")
+
+                if reasoning_details_to_cache:
+                    # Cache by the assistant message content (what we just generated)
+                    # Build a message dict from the accumulated content to hash
+                    assistant_message = {"content": content}
+                    msg_hash = get_message_content_hash(assistant_message)
+                    reasoning_cache[msg_hash] = reasoning_details_to_cache
+                    logger.info(f"Cached reasoning_details for message {msg_hash[:8]}... (streaming V2)")
 
                 # Transform usage from OpenRouter format to Anthropic format for LangFuse
                 anthropic_usage = {}

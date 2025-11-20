@@ -100,6 +100,7 @@ class RequestTransformer:
         Handles:
         - Content blocks with tool_use and tool_result
         - Converting Anthropic's content array format to OpenRouter's format
+        - Injecting reasoning_details from cache into assistant messages
 
         Args:
             anthropic_messages: List of Anthropic-format messages
@@ -107,18 +108,64 @@ class RequestTransformer:
         Returns:
             List of OpenRouter-format messages
         """
+        # Check if we have cached reasoning_details for assistant messages
+        from proxy import reasoning_cache, get_message_content_hash
+        import logging
+        logger = logging.getLogger(__name__)
+
         openrouter_messages = []
 
-        for msg in anthropic_messages:
+        for idx, msg in enumerate(anthropic_messages):
             role = msg.get("role")
             content = msg.get("content")
 
+            # Inject reasoning_details into assistant messages if available and not already present
+            # Strategy 1: Check for tool calls and look up by tool_call ID (for reasoning with tool calls)
+            # Strategy 2: Hash the assistant message content to look up cached reasoning_details
+            cached_reasoning = None
+            should_inject_reasoning = False
+
+            if role == "assistant" and "reasoning_details" not in msg:
+                # First, check if this message has tool_use blocks with IDs
+                tool_call_ids = []
+                if isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "tool_use":
+                            tool_id = block.get("id")
+                            if tool_id:
+                                tool_call_ids.append(tool_id)
+
+                # Look up reasoning by tool_call ID if available
+                if tool_call_ids:
+                    for tool_id in tool_call_ids:
+                        cache_key = f"tool_call:{tool_id}"
+                        cached = reasoning_cache.get(cache_key)
+                        if cached:
+                            cached_reasoning = cached
+                            should_inject_reasoning = True
+                            logger.info(f"Found cached reasoning_details for tool_call {tool_id[:20]}...")
+                            break  # Use the first match
+
+                # Fallback: Hash this assistant message's content to find cached reasoning
+                if not cached_reasoning:
+                    msg_hash = get_message_content_hash(msg)
+                    cached_reasoning = reasoning_cache.get(msg_hash)
+
+                    if cached_reasoning:
+                        should_inject_reasoning = True
+                        logger.info(f"Found cached reasoning_details for message {msg_hash[:8]}, will inject into assistant message")
+
             # Handle string content (simple case)
             if isinstance(content, str):
-                openrouter_messages.append({
+                openrouter_msg = {
                     "role": role,
                     "content": content
-                })
+                }
+                # Inject reasoning_details if needed
+                if should_inject_reasoning:
+                    openrouter_msg["reasoning_details"] = cached_reasoning
+                    logger.info(f"Injected reasoning_details into assistant message")
+                openrouter_messages.append(openrouter_msg)
                 continue
 
             # Handle array content (complex case with tool use/results)
@@ -184,6 +231,11 @@ class RequestTransformer:
                         if tool_calls:
                             openrouter_msg["tool_calls"] = tool_calls
 
+                        # Inject reasoning_details if needed
+                        if should_inject_reasoning:
+                            openrouter_msg["reasoning_details"] = cached_reasoning
+                            logger.info(f"Injected reasoning_details into assistant message with tool calls")
+
                         openrouter_messages.append(openrouter_msg)
                     else:
                         # Regular content blocks (text, image, etc.)
@@ -193,16 +245,30 @@ class RequestTransformer:
                             if isinstance(block, dict) and block.get("type") == "text":
                                 text_parts.append(block.get("text", ""))
 
-                        openrouter_messages.append({
+                        openrouter_msg = {
                             "role": role,
                             "content": " ".join(text_parts) if text_parts else ""
-                        })
+                        }
+
+                        # Inject reasoning_details if needed
+                        if should_inject_reasoning:
+                            openrouter_msg["reasoning_details"] = cached_reasoning
+                            logger.info(f"Injected reasoning_details into assistant message with content blocks")
+
+                        openrouter_messages.append(openrouter_msg)
             else:
                 # Fallback for unexpected formats
-                openrouter_messages.append({
+                openrouter_msg = {
                     "role": role,
                     "content": str(content)
-                })
+                }
+
+                # Inject reasoning_details if needed
+                if should_inject_reasoning:
+                    openrouter_msg["reasoning_details"] = cached_reasoning
+                    logger.info(f"Injected reasoning_details into assistant message (fallback)")
+
+                openrouter_messages.append(openrouter_msg)
 
         return openrouter_messages
 
