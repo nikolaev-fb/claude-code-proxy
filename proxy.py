@@ -558,7 +558,7 @@ async def messages(request: Request) -> Response:
                         model=anthropic_model,
                         input={
                             "model": anthropic_model,
-                            "messages": request_body.get("messages"),
+                            "messages": openrouter_request.get("messages"),  # Use transformed messages (includes reasoning_details)
                             "system": request_body.get("system"),
                             "tools": request_body.get("tools"),
                             "max_tokens": request_body.get("max_tokens"),
@@ -576,7 +576,7 @@ async def messages(request: Request) -> Response:
                         model=anthropic_model,
                         input={
                             "model": anthropic_model,
-                            "messages": request_body.get("messages"),
+                            "messages": openrouter_request.get("messages"),  # Use transformed messages (includes reasoning_details)
                             "system": request_body.get("system"),
                             "tools": request_body.get("tools"),
                             "max_tokens": request_body.get("max_tokens"),
@@ -749,6 +749,7 @@ async def handle_non_streaming_messages(
             logger.debug(f"OpenRouter response: {json.dumps(openrouter_response, indent=2)}")
 
             # Capture reasoning_details if present (for models like google/gemini-3-pro-preview)
+            reasoning_details_cached = None
             if "choices" in openrouter_response and openrouter_response["choices"]:
                 message = openrouter_response["choices"][0].get("message", {})
                 reasoning_details = message.get("reasoning_details")
@@ -758,6 +759,7 @@ async def handle_non_streaming_messages(
                     # appears in follow-up requests (e.g., with tool results)
                     msg_hash = get_message_content_hash({"content": message.get("content", "")})
                     reasoning_cache[msg_hash] = reasoning_details
+                    reasoning_details_cached = reasoning_details
                     logger.info(f"Cached reasoning_details for message {msg_hash[:8]}... (non-streaming)")
 
             # Transform response back to Anthropic format
@@ -768,13 +770,18 @@ async def handle_non_streaming_messages(
             logger.debug(f"Transformed response: {json.dumps(anthropic_response, indent=2)}")
 
             # Update LangFuse generation with output and usage if it was created
+            output_data = {
+                "model": anthropic_response.get("model"),
+                "content": anthropic_response.get("content", []),
+                "stop_reason": anthropic_response.get("stop_reason"),
+            }
+            # Include reasoning_details in output if available
+            if reasoning_details_cached:
+                output_data["reasoning_details"] = reasoning_details_cached
+
             _update_generation_safe(
                 generation,
-                output={
-                    "model": anthropic_response.get("model"),
-                    "content": anthropic_response.get("content", []),
-                    "stop_reason": anthropic_response.get("stop_reason"),
-                },
+                output=output_data,
                 usage=anthropic_response.get("usage", {}),  # Pass usage separately for token tracking
                 metadata={
                     "status": "success",
@@ -1588,13 +1595,18 @@ async def stream_messages_v2(
                     }
 
                 # Update LangFuse generation with complete content structure
+                output_data = {
+                    "model": anthropic_model,
+                    "content": content,  # Complete content array with all block types
+                    "stop_reason": actual_stop_reason,  # Actual stop reason from finish chunk
+                }
+                # Include reasoning_details in output if available
+                if reasoning_details_to_cache:
+                    output_data["reasoning_details"] = reasoning_details_to_cache
+
                 _update_generation_safe(
                     generation,
-                    output={
-                        "model": anthropic_model,
-                        "content": content,  # Complete content array with all block types
-                        "stop_reason": actual_stop_reason,  # Actual stop reason from finish chunk
-                    },
+                    output=output_data,
                     usage=anthropic_usage,  # Anthropic-formatted usage for token tracking
                     metadata={
                         "status": "streaming_completed_v2",
